@@ -14,6 +14,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <TMC2209.h>
+#include <QuickPID.h>
+#include <sTune.h>
 
 // ─── I2C / AS5600 via TCA9548A (arm-as encoders) ────────────
 constexpr uint8_t TCA_ADDR = 0x70;
@@ -39,6 +41,64 @@ constexpr long     MICRO_PER_REV = (long)MICROSTEPS * (long)FULL_STEPS;  // 5120
 // Default test currents
 constexpr int RUN_CURRENT_PCT  = 60;
 constexpr int HOLD_CURRENT_PCT = 40;
+
+// ─── PID closed-loop per joint via QuickPID + unwrap ─────────
+// QuickPID gebruikt float pointers (input, output, setpoint). Per joint instance.
+// AS5600 raw 0..360° wordt unwrapped naar continuous float zodat D-term niet spike
+// rond de 360→0° wrap.
+static float pidIn[3]  = {0,0,0};   // unwrapped arm degrees (PID input)
+static float pidOut[3] = {0,0,0};   // VACTUAL command (float, cast bij output)
+static float pidSp[3]  = {0,0,0};   // setpoint degrees
+
+QuickPID joint0(&pidIn[0], &pidOut[0], &pidSp[0]);
+QuickPID joint1(&pidIn[1], &pidOut[1], &pidSp[1]);
+QuickPID joint2(&pidIn[2], &pidOut[2], &pidSp[2]);
+static QuickPID* joints[3] = { &joint0, &joint1, &joint2 };
+
+// Unwrap state per joint
+static bool  unwrapInit[3]   = {false, false, false};
+static float unwrapLastDeg[3] = {0,0,0};
+static float unwrapBase[3]   = {0,0,0};   // accumulated value at unwrapLastDeg
+
+static bool      pidActive[3]      = {false, false, false};
+static int32_t   pidLastVactual[3] = {0,0,0};
+
+// QuickPID heeft geen GetTunings; bewaar gains zelf
+static float pidKp[3] = {0,0,0};
+static float pidKi[3] = {0,0,0};
+static float pidKd[3] = {0,0,0};
+
+// Forward declarations
+static bool refreshPidInput(int i);
+
+// Step-response logging per joint
+static bool     logActive[3]    = {false, false, false};
+static uint32_t logStartMs[3]   = {0,0,0};
+static uint32_t logEndMs[3]     = {0,0,0};
+static uint32_t logLastMs[3]    = {0,0,0};
+
+// sTune voor autotune (één joint tegelijk).
+static int      tuneJoint        = -1;     // -1 = niet actief
+static float    tuneIn, tuneOut, tuneSetpoint;
+static float    tuneInOffset = 0.0f;  // start-positie; tuner ziet relatieve input (0-start)
+static sTune    tuner(&tuneIn, &tuneOut, sTune::ZN_PID, sTune::directIP, sTune::printALL);
+static constexpr int32_t PID_VACTUAL_MAX = 140000;
+
+// Update unwrap, return unwrapped degrees.
+static float unwrapDeg(int i, float rawDeg) {
+    if (!unwrapInit[i]) {
+        unwrapInit[i]   = true;
+        unwrapLastDeg[i] = rawDeg;
+        unwrapBase[i]   = rawDeg;
+        return rawDeg;
+    }
+    float delta = rawDeg - unwrapLastDeg[i];
+    if (delta >  180.0f) delta -= 360.0f;
+    if (delta < -180.0f) delta += 360.0f;
+    unwrapBase[i]   += delta;
+    unwrapLastDeg[i] = rawDeg;
+    return unwrapBase[i];
+}
 
 TMC2209 drivers[3];
 
@@ -145,6 +205,14 @@ static void printHelp() {
     Serial.println("  DUMP            → toon settings van alle 3 drivers");
     Serial.println("  STOP            → alle motors disable");
     Serial.println("  ?               → deze help");
+    Serial.println("─── PID closed-loop (QuickPID + sTune autotune) ──");
+    Serial.println("  SETKP <i> <v>   → P-gain voor joint i");
+    Serial.println("  SETKI <i> <v>   → I-gain (gevaarlijk zonder goede P+D!)");
+    Serial.println("  SETKD <i> <v>   → D-gain");
+    Serial.println("  GOTO <i> <deg>  → PID actief, target=deg (unwrapped)");
+    Serial.println("  STEPRESP <i> <delta> → step + log 2s @ 200Hz (CSV: LOG,j,t,err,in,sp,out)");
+    Serial.println("  AUTOTUNE <i>    → sTune relay-tune (~5s, gevolgd door GOTO)");
+    Serial.println("  PIDOFF          → PID stop, motors disable");
     Serial.println("─────────────────────────────────────────");
 }
 
@@ -158,6 +226,99 @@ static void handleCmd(String line) {
     if (line.startsWith("STOP")) {
         for (int i = 0; i < 3; i++) { drivers[i].moveAtVelocity(0); drivers[i].disable(); }
         Serial.println("STOP — all motors disabled");
+        return;
+    }
+    // Helper: parse "<verb> <i> <v>" → idx, val. Returnt false bij parse-fout.
+    auto parseTwoArgs = [](const String& s, int prefixLen, int& i, float& v) -> bool {
+        int s1 = s.indexOf(' ', prefixLen);
+        if (s1 < 0) return false;
+        i = s.substring(prefixLen, s1).toInt();
+        v = s.substring(s1+1).toFloat();
+        return i >= 0 && i <= 2;
+    };
+
+    if (line.startsWith("SETKP ") || line.startsWith("SETKI ") || line.startsWith("SETKD ")) {
+        int i; float v;
+        if (!parseTwoArgs(line, 6, i, v)) { Serial.println("ERR: SETKx <i> <v>"); return; }
+        if      (line.startsWith("SETKP")) pidKp[i] = v;
+        else if (line.startsWith("SETKI")) pidKi[i] = v;
+        else                                pidKd[i] = v;
+        joints[i]->SetTunings(pidKp[i], pidKi[i], pidKd[i]);
+        Serial.printf("M%d gains: KP=%.3f KI=%.3f KD=%.3f\n", i+1, pidKp[i], pidKi[i], pidKd[i]);
+        return;
+    }
+    if (line.startsWith("GOTO ")) {
+        int i; float t;
+        if (!parseTwoArgs(line, 5, i, t)) { Serial.println("ERR: GOTO <i> <deg>"); return; }
+        drivers[i].setMicrostepsPerStep(256);
+        drivers[i].disableStealthChop();
+        drivers[i].setRunCurrent((uint8_t)g_run_current);
+        drivers[i].enable();
+        refreshPidInput(i);
+        pidSp[i] = t;
+        joints[i]->SetMode(QuickPID::Control::automatic);
+        pidActive[i] = true;
+        float kp = pidKp[i], ki = pidKi[i], kd = pidKd[i];
+        Serial.printf("M%d GOTO sp=%.2f° in=%.2f° (KP=%.3f KI=%.3f KD=%.3f)\n",
+            i+1, t, pidIn[i], kp, ki, kd);
+        return;
+    }
+    if (line.startsWith("STEPRESP ")) {
+        int i; float d;
+        if (!parseTwoArgs(line, 9, i, d)) { Serial.println("ERR: STEPRESP <i> <delta>"); return; }
+        drivers[i].setMicrostepsPerStep(256);
+        drivers[i].disableStealthChop();
+        drivers[i].setRunCurrent((uint8_t)g_run_current);
+        drivers[i].enable();
+        refreshPidInput(i);
+        pidSp[i] = pidIn[i] + d;
+        joints[i]->SetMode(QuickPID::Control::automatic);
+        pidActive[i]   = true;
+        logActive[i]   = true;
+        logStartMs[i]  = millis();
+        logEndMs[i]    = logStartMs[i] + 2000;
+        logLastMs[i]   = 0;
+        float kp = pidKp[i], ki = pidKi[i], kd = pidKd[i];
+        Serial.printf("# STEPRESP M%d  from=%.2f → to=%.2f  (KP=%.3f KI=%.3f KD=%.3f)\n",
+            i+1, pidIn[i] - d, pidSp[i], kp, ki, kd);
+        Serial.println("# CSV: LOG,joint,t_ms,err,in,sp,out");
+        return;
+    }
+    if (line.startsWith("AUTOTUNE ")) {
+        int i = line.substring(9).toInt();
+        if (i < 0 || i > 2) { Serial.println("ERR i"); return; }
+        drivers[i].setMicrostepsPerStep(256);
+        drivers[i].disableStealthChop();
+        drivers[i].setRunCurrent((uint8_t)g_run_current);
+        drivers[i].enable();
+        refreshPidInput(i);
+        // sTune Configure: input/output ranges, target span, settle time, samples, sample time.
+        // outputStep = magnitude voor step input. testTimeSec = duration of identification.
+        tuner.Reset();
+        tuner.Configure(/*inputSpan*/ 360.0f, /*outputSpan*/ 200000.0f,
+                        /*outputStart*/ 0.0f, /*outputStep*/ 50000.0f,
+                        /*testTimeSec*/ 5,    /*settleTimeSec*/ 1,
+                        /*samples*/ 250);
+        tuner.SetEmergencyStop(45.0f);  // stop bij 45° relatieve deviatie (safety)
+        // Tuner ziet relatieve input: start = 0, eStop check werkt dan op deviatie.
+        tuneInOffset = pidIn[i];
+        tuneIn = 0.0f;
+        tuneOut = 0;
+        tuneJoint = i;
+        Serial.printf("# AUTOTUNE M%d started — keep arm clear, takes ~5s\n", i+1);
+        return;
+    }
+    if (line.startsWith("PIDOFF")) {
+        for (int i = 0; i < 3; i++) {
+            if (pidActive[i] || tuneJoint == i) {
+                drivers[i].moveAtVelocity(0);
+                drivers[i].disable();
+                joints[i]->SetMode(QuickPID::Control::manual);
+                pidActive[i] = false;
+            }
+        }
+        tuneJoint = -1;
+        Serial.println("PID off, motors disabled");
         return;
     }
     if (line.startsWith("POS ")) {
@@ -297,9 +458,84 @@ void setup() {
         }
     }
 
+    // QuickPID configuratie per joint
+    for (int i = 0; i < 3; i++) {
+        joints[i]->SetOutputLimits(-(float)PID_VACTUAL_MAX, (float)PID_VACTUAL_MAX);
+        joints[i]->SetSampleTimeUs(2000);  // 500 Hz
+        joints[i]->SetTunings(0.0f, 0.0f, 0.0f);  // begin met alles 0; SETKx live
+        joints[i]->SetMode(QuickPID::Control::manual);
+        joints[i]->SetProportionalMode(QuickPID::pMode::pOnError);
+        joints[i]->SetDerivativeMode(QuickPID::dMode::dOnMeas);   // D op meting, niet error
+        joints[i]->SetAntiWindupMode(QuickPID::iAwMode::iAwCondition);
+    }
+
     printHelp();
+}
+
+// Update pidIn[i] uit AS5600 + unwrap. Returnt false bij encoder-fout.
+static bool refreshPidInput(int i) {
+    float rawDeg = 0.0f;
+    if (!readAS5600Deg(i, rawDeg)) return false;
+    pidIn[i] = unwrapDeg(i, rawDeg);
+    return true;
+}
+
+static void pushVactual(int i, float out) {
+    int32_t v = (int32_t)out;
+    if (v >  PID_VACTUAL_MAX) v =  PID_VACTUAL_MAX;
+    if (v < -PID_VACTUAL_MAX) v = -PID_VACTUAL_MAX;
+    if (v != pidLastVactual[i]) {
+        drivers[i].moveAtVelocity(v);
+        pidLastVactual[i] = v;
+    }
+}
+
+static void pidServiceJoint(int i) {
+    if (!pidActive[i] && tuneJoint != i) return;
+    if (!refreshPidInput(i)) return;
+
+    if (tuneJoint == i) {
+        // Autotune via sTune — relatieve input (0-start) zodat eStop op deviatie werkt
+        tuneIn = pidIn[i] - tuneInOffset;
+        if (tuner.Run() != tuner.tunings) {
+            pushVactual(i, tuneOut);
+        } else {
+            // Tuning klaar: lees uit en zet op joint
+            float kp, ki, kd;
+            tuner.GetAutoTunings(&kp, &ki, &kd);
+            joints[i]->SetTunings(kp, ki, kd);
+            joints[i]->SetMode(QuickPID::Control::automatic);
+            Serial.printf("# AUTOTUNE done M%d: KP=%.3f KI=%.3f KD=%.3f\n",
+                          i+1, kp, ki, kd);
+            tuneJoint   = -1;
+            pidActive[i] = true;
+        }
+    } else if (joints[i]->Compute()) {
+        pushVactual(i, pidOut[i]);
+    }
+
+    // Step-response logging
+    uint32_t now = millis();
+    if (logActive[i]) {
+        if (now >= logEndMs[i]) {
+            logActive[i] = false;
+            Serial.println("# step-response logging done");
+        } else if (now - logLastMs[i] >= 5) {
+            logLastMs[i] = now;
+            float err = pidSp[i] - pidIn[i];
+            Serial.printf("LOG,M%d,t=%lu,err=%.2f,in=%.2f,sp=%.2f,out=%.0f\n",
+                i+1, (unsigned long)(now - logStartMs[i]),
+                err, pidIn[i], pidSp[i], pidOut[i]);
+        }
+    }
 }
 
 void loop() {
     pollSerial();
+    static uint32_t lastPidMs = 0;
+    uint32_t now = millis();
+    if (now - lastPidMs >= 2) {   // 500 Hz service
+        lastPidMs = now;
+        for (int i = 0; i < 3; i++) pidServiceJoint(i);
+    }
 }

@@ -273,7 +273,10 @@ void ledUpdate() {
 // Factor waarmee virtualMs groeit. 1.0 = originele opname-snelheid.
 // Lager = trager afspelen, betere pad-volging maar langere duur.
 // Een cirkel van 15s opname wordt bij 0.4 afgespeeld in 37.5s wall-clock.
-static const float PLAYBACK_SPEED = 0.15f;
+// 2026-06-09: PLAYBACK_SPEED is nu runtime-instelbaar via >PLAYBACKSPEED <pct>.
+// Default 15% = v14.6 origineel ("slow but accurate"). 100 = recording-snelheid.
+static int   playbackSpeedPct = 15;
+static float PLAYBACK_SPEED   = 0.15f;   // = playbackSpeedPct / 100.0f
 
 // 256 microsteps × 400 fullsteps = 102400 steps/motoromwenteling
 static const long     STEPS_PER_REV          = 102400;
@@ -313,6 +316,10 @@ static const float VERNIER_MATCH_THRESHOLD_DEG = 45.0f;
 static float KP_SPEED[3] = { 6.5f,  3.0f,  6.8f };   // M2 terug naar 3.0
 static float KI_SPEED[3] = { 0.0f,  0.05f, 0.0f };   // M2 kleine I
 static float KD_SPEED[3] = { 3.0f,  2.5f,  3.5f };   // M2 ook terug
+// 2026-06-09: Velocity feedforward gain per joint, instelbaar via >KFF <i> <v>.
+// Default 1.0 = v19 origineel gedrag (refVelScaled rechtstreeks).
+// Tune om gain-mismatch (FCLKTRIM, microstep timing, MOTOR_VACTUAL_CORR) te compenseren.
+static float KFF_V[3]    = { 1.0f,  1.0f,  1.0f };
 static float KP_HOME  = 4.5f;
 static float KD_HOME  = 4.0f;
 
@@ -1221,7 +1228,7 @@ void handlePlayback() {
 
         float speedCmd = 0.0f;
         if (!mc[i].inDeadBand) {
-            speedCmd = refVelScaled + kp * (float)error + KD_SPEED[i] * mc[i].dErrFilt;
+            speedCmd = KFF_V[i] * refVelScaled + kp * (float)error + KD_SPEED[i] * mc[i].dErrFilt;
             // === DIAGNOSTIEK v14.4 — meet voor clamp ===
             cmdPreBuf[i]  = speedCmd;
             clippedBuf[i] = (fabsf(speedCmd) > MAX_SPEED_STEPS_S);
@@ -1539,6 +1546,19 @@ static void cmdCurrent(int idx, int pct) {
     cmdReplyf("<OK ", "current M%d run=%d%% (RAM only — CURRENTSAVE voor NVS)", idx + 1, pct);
 }
 
+static void cmdKff(int idx, float val) {
+    if (idx < 0 || idx > 2) { cmdReply("<ERR ", "idx 0..2"); return; }
+    KFF_V[idx] = val;
+    cmdReplyf("<OK ", "KFF M%d = %.3f", idx+1, val);
+}
+
+static void cmdPlaybackSpeed(int pct) {
+    if (pct < 1 || pct > 200) { cmdReply("<ERR ", "pct 1..200"); return; }
+    playbackSpeedPct = pct;
+    PLAYBACK_SPEED   = (float)pct / 100.0f;
+    cmdReplyf("<OK ", "PLAYBACK_SPEED = %d%% (%.2f)", pct, PLAYBACK_SPEED);
+}
+
 static void cmdCurrentSave() {
     saveCurrentsToNVS();
     cmdReplyf("<OK ", "currents saved to NVS: [%d, %d, %d]",
@@ -1746,6 +1766,19 @@ static void processCmdLine(const String& line) {
     else if (verb == "LIMITS")    cmdLimits();
     else if (verb == "LIMITSAVE") cmdLimitSave();
     else if (verb == "CURRENTSAVE") cmdCurrentSave();
+    else if (verb == "KFF") {
+        rest.trim();
+        int s1 = rest.indexOf(' ');
+        if (s1 < 0) { cmdReply("<ERR ", "usage: KFF <i> <v>"); return; }
+        int idx = rest.substring(0, s1).toInt();
+        float val = rest.substring(s1 + 1).toFloat();
+        cmdKff(idx, val);
+    }
+    else if (verb == "PLAYBACKSPEED") {
+        rest.trim();
+        if (rest.length() == 0) { cmdReply("<ERR ", "usage: PLAYBACKSPEED <pct>"); return; }
+        cmdPlaybackSpeed(rest.toInt());
+    }
     else if (verb == "ENCRAW")    cmdEncRaw();
     else if (verb == "TMCSTATUS") cmdTmcStatus();
     else if (verb == "POS") {
