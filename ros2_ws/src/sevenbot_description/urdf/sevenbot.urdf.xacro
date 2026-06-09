@@ -1,0 +1,188 @@
+<?xml version="1.0"?>
+<!--
+  7Bot Desktop Robotic Arm — URDF
+  Kickstarter 2015 / PineconeAI / 6 servo's + optionele gripper.
+
+  GEOMETRIE bron: officiële Arduino library Arm7Bot.h en Arm7Bot.cpp
+    https://github.com/7Bot/7Bot-Arduino-lib/blob/master/Arm7Bot/src/Arm7Bot.h
+
+  Constants uit firmware (alle mm):
+    a = 120.0   upper arm length     (J1 → J3 axis)
+    b = 40.0    shoulder offset
+    c = 198.50  forearm length       (J4 → J5)
+    d = 30.05   base radial offset   (J0 yaw → J1)
+    e = 77.80   (vermoedelijk gripper finger of pump offset)
+    f = 22.10   wrist length         (J5 → J6)
+    g = 12.0    end effector offset  (J6 → tool tip)
+    h = 29.42   elbow offset
+
+  Joint limits (rad, per servo):
+    theta[0]: 0 → π          (base yaw)
+    theta[1]: 0 → π          (shoulder pitch)
+    theta[2]: -1.1345 → 2.0071  (elbow pitch — heeft offset 1.134464 in IK)
+    theta[3]: 0.1745 → 2.9671   (wrist roll)
+    theta[4]: 0 → π          (wrist pitch)
+    theta[5]: 0 → π          (wrist roll-2)
+    theta[6]: 0 → π/2        (gripper, NIET hier — apart of vacuum)
+
+  Initial pose servo posities (deg): {90, 115, 65, 90, 90, 90, 75}
+  Initial coords J5: {0, 178, 216} mm  (verifiëren)
+  Initial coords J6: {0, 192, 233} mm
+
+  AANNAMES (te valideren door meten van de echte arm):
+    - Joint axes: J0 = Z, J1/J2/J4 = Y (pitch), J3/J5 = X (roll)
+    - Mass/inertia: educated guesses (~0.1-0.3 kg per link)
+    - Mesh = simpele cylinders/boxen tot we echte STLs hebben
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="sevenbot">
+
+  <!-- ====== AFMETINGEN (m, kg) — uit Arm7Bot.h ====== -->
+  <xacro:property name="L_a"       value="0.120"/>   <!-- upper arm -->
+  <xacro:property name="L_b"       value="0.040"/>   <!-- shoulder offset -->
+  <xacro:property name="L_c"       value="0.1985"/>  <!-- forearm -->
+  <xacro:property name="L_d"       value="0.03005"/> <!-- base radial offset -->
+  <xacro:property name="L_e"       value="0.0778"/>
+  <xacro:property name="L_f"       value="0.0221"/>  <!-- wrist length -->
+  <xacro:property name="L_g"       value="0.012"/>   <!-- ee offset -->
+  <xacro:property name="L_h"       value="0.02942"/> <!-- elbow offset -->
+
+  <xacro:property name="base_h"    value="0.06"/>    <!-- gemeten basis hoogte (schat) -->
+  <xacro:property name="base_r"    value="0.06"/>
+
+  <xacro:property name="link_r"    value="0.012"/>   <!-- aluminium buisjes ~24mm OD -->
+
+  <xacro:property name="m_base"    value="0.6"/>
+  <xacro:property name="m_link"    value="0.15"/>
+  <xacro:property name="m_wrist"   value="0.08"/>
+  <xacro:property name="m_ee"      value="0.05"/>
+
+  <xacro:property name="effort"    value="3.0"/>     <!-- digitale servo, ~3 Nm peak -->
+  <xacro:property name="vel_lim"   value="3.5"/>     <!-- ~200 deg/s servo speed -->
+
+  <!-- ====== HELPERS ====== -->
+  <xacro:macro name="cyl_inertial" params="m r h">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia
+        ixx="${m * (3*r*r + h*h) / 12}" iyy="${m * (3*r*r + h*h) / 12}"
+        izz="${m * r*r / 2}"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </xacro:macro>
+
+  <material name="alu">    <color rgba="0.85 0.85 0.88 1"/></material>
+  <material name="black">  <color rgba="0.10 0.10 0.10 1"/></material>
+  <material name="orange"> <color rgba="0.95 0.45 0.10 1"/></material>
+
+  <!-- ====== WORLD anchor ====== -->
+  <link name="world"/>
+
+  <!-- Mesh helper: STL paths uit sevenbot_description/meshes/ -->
+  <xacro:macro name="link_mesh" params="name color_name">
+    <visual>
+      <geometry><mesh filename="package://sevenbot_description/meshes/${name}_link.stl" scale="0.001 0.001 0.001"/></geometry>
+      <material name="${color_name}"/>
+    </visual>
+    <collision>
+      <geometry><mesh filename="package://sevenbot_description/meshes/${name}_link.stl" scale="0.001 0.001 0.001"/></geometry>
+    </collision>
+  </xacro:macro>
+
+  <!-- ====== BASE ====== -->
+  <link name="base_link">
+    <xacro:link_mesh name="base" color_name="black"/>
+    <xacro:cyl_inertial m="${m_base}" r="${base_r}" h="${base_h}"/>
+  </link>
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/><child link="base_link"/>
+  </joint>
+
+  <!-- ====== JOINT 0: base yaw (servo 0) ====== -->
+  <link name="shoulder_link">
+    <xacro:link_mesh name="shoulder" color_name="black"/>
+    <xacro:cyl_inertial m="${m_link/2}" r="${link_r}" h="${L_b}"/>
+  </link>
+  <joint name="joint_0" type="revolute">
+    <parent link="base_link"/><child link="shoulder_link"/>
+    <origin xyz="${L_d} 0 ${base_h}" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="${pi}" effort="${effort}" velocity="${vel_lim}"/>
+    <dynamics damping="0.05"/>
+  </joint>
+
+  <!-- ====== JOINT 1: shoulder pitch (servo 1) ====== -->
+  <link name="upper_arm_link">
+    <xacro:link_mesh name="upper_arm" color_name="alu"/>
+    <xacro:cyl_inertial m="${m_link}" r="${link_r}" h="${L_a}"/>
+  </link>
+  <joint name="joint_1" type="revolute">
+    <parent link="shoulder_link"/><child link="upper_arm_link"/>
+    <origin xyz="0 0 ${L_b}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="${pi}" effort="${effort}" velocity="${vel_lim}"/>
+    <dynamics damping="0.1"/>
+  </joint>
+
+  <!-- ====== JOINT 2: elbow pitch (servo 2, met +1.134464 rad mechanische offset) ====== -->
+  <link name="forearm_link">
+    <xacro:link_mesh name="forearm" color_name="alu"/>
+    <xacro:cyl_inertial m="${m_link}" r="${link_r}" h="${L_c}"/>
+  </link>
+  <joint name="joint_2" type="revolute">
+    <parent link="upper_arm_link"/><child link="forearm_link"/>
+    <origin xyz="0 0 ${L_a}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.134464" upper="2.0071287" effort="${effort}" velocity="${vel_lim}"/>
+    <dynamics damping="0.1"/>
+  </joint>
+
+  <!-- ====== JOINT 3: forearm roll (servo 3) — geen geometrie verandering ====== -->
+  <link name="forearm_roll_link">
+    <xacro:link_mesh name="forearm_roll" color_name="black"/>
+    <xacro:cyl_inertial m="${m_wrist}" r="${link_r}" h="${L_h}"/>
+  </link>
+  <joint name="joint_3" type="revolute">
+    <parent link="forearm_link"/><child link="forearm_roll_link"/>
+    <origin xyz="0 0 ${L_c}"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0.1745329" upper="2.9670596" effort="${effort}" velocity="${vel_lim}"/>
+    <dynamics damping="0.05"/>
+  </joint>
+
+  <!-- ====== JOINT 4: wrist pitch (servo 4) ====== -->
+  <link name="wrist_pitch_link">
+    <xacro:link_mesh name="wrist_pitch" color_name="orange"/>
+    <xacro:cyl_inertial m="${m_wrist}" r="${link_r}" h="${L_f}"/>
+  </link>
+  <joint name="joint_4" type="revolute">
+    <parent link="forearm_roll_link"/><child link="wrist_pitch_link"/>
+    <origin xyz="0 0 ${L_h}"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0" upper="${pi}" effort="${effort}" velocity="${vel_lim}"/>
+    <dynamics damping="0.05"/>
+  </joint>
+
+  <!-- ====== JOINT 5: wrist roll-2 (servo 5) ====== -->
+  <link name="wrist_roll_link">
+    <xacro:link_mesh name="wrist_roll" color_name="black"/>
+    <xacro:cyl_inertial m="${m_ee}" r="${link_r*0.7}" h="${L_g}"/>
+  </link>
+  <joint name="joint_5" type="revolute">
+    <parent link="wrist_pitch_link"/><child link="wrist_roll_link"/>
+    <origin xyz="0 0 ${L_f}"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="${pi}" effort="${effort}" velocity="${vel_lim}"/>
+    <dynamics damping="0.05"/>
+  </joint>
+
+  <!-- ====== END EFFECTOR (vacuüm of gripper) ====== -->
+  <link name="ee_link">
+    <xacro:link_mesh name="ee" color_name="black"/>
+    <xacro:cyl_inertial m="0.02" r="0.015" h="0.04"/>
+  </link>
+  <joint name="ee_joint" type="fixed">
+    <parent link="wrist_roll_link"/><child link="ee_link"/>
+    <origin xyz="0 0 ${L_g}"/>
+  </joint>
+
+</robot>

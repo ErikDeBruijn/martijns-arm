@@ -1,0 +1,173 @@
+<?xml version="1.0"?>
+<!--
+  Martijn's robotarm — 3-DOF, eerste benadering.
+
+  AANNAMES (te verifiëren op de echte arm):
+    - 3 onafhankelijke revolute joints (firmware heeft 3 PID loops)
+    - Configuratie: base_yaw → shoulder_pitch → elbow_pitch
+    - Parallelogram-mechanica is gemodelleerd als enkele elbow joint
+      (kinematisch equivalent voor wat we hier willen visualiseren)
+    - Afmetingen geschat op basis van foto's, NIET gemeten
+    - Joint limits conservatief op ±pi rad; firmware heeft geen software
+      limits, alleen mechanische
+    - Mesh = simpele box/cylinder placeholders; vervang door STL exports
+      uit Martijn's CAD wanneer beschikbaar
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="martijns_arm">
+
+  <!-- ====== AFMETINGEN (meters / kg) ====== -->
+  <xacro:property name="base_radius"       value="0.08"/>
+  <xacro:property name="base_height"       value="0.04"/>
+  <xacro:property name="post_radius"       value="0.025"/>
+  <xacro:property name="post_height"       value="0.10"/>
+  <xacro:property name="upper_length"      value="0.18"/>
+  <xacro:property name="upper_thickness"   value="0.025"/>
+  <xacro:property name="forearm_length"    value="0.18"/>
+  <xacro:property name="forearm_thickness" value="0.020"/>
+  <xacro:property name="ee_size"           value="0.06"/>
+
+  <xacro:property name="base_mass"    value="1.0"/>
+  <xacro:property name="post_mass"    value="0.4"/>
+  <xacro:property name="upper_mass"   value="0.5"/>
+  <xacro:property name="forearm_mass" value="0.3"/>
+  <xacro:property name="ee_mass"      value="0.1"/>
+
+  <xacro:property name="joint_effort"   value="5.0"/>
+  <xacro:property name="joint_velocity" value="2.0"/>
+
+  <!-- ====== HELPERS ====== -->
+  <xacro:macro name="cylinder_inertial" params="m r h">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia
+        ixx="${m * (3*r*r + h*h) / 12}" iyy="${m * (3*r*r + h*h) / 12}"
+        izz="${m * r*r / 2}"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="box_inertial" params="m x y z">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia
+        ixx="${m * (y*y + z*z) / 12}"
+        iyy="${m * (x*x + z*z) / 12}"
+        izz="${m * (x*x + y*y) / 12}"
+        ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- ====== MATERIALS ====== -->
+  <material name="grey">      <color rgba="0.55 0.55 0.55 1"/></material>
+  <material name="dark_grey"> <color rgba="0.30 0.30 0.30 1"/></material>
+  <material name="orange">    <color rgba="0.95 0.45 0.10 1"/></material>
+
+  <!-- ====== BASE (vast aan world) ====== -->
+  <link name="world"/>
+
+  <link name="base_link">
+    <visual>
+      <geometry><cylinder radius="${base_radius}" length="${base_height}"/></geometry>
+      <origin xyz="0 0 ${base_height/2}"/>
+      <material name="dark_grey"/>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="${base_radius}" length="${base_height}"/></geometry>
+      <origin xyz="0 0 ${base_height/2}"/>
+    </collision>
+    <xacro:cylinder_inertial m="${base_mass}" r="${base_radius}" h="${base_height}"/>
+  </link>
+
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/>
+    <child  link="base_link"/>
+  </joint>
+
+  <!-- ====== JOINT 1: M1 — base yaw ====== -->
+  <link name="post_link">
+    <visual>
+      <geometry><cylinder radius="${post_radius}" length="${post_height}"/></geometry>
+      <origin xyz="0 0 ${post_height/2}"/>
+      <material name="grey"/>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="${post_radius}" length="${post_height}"/></geometry>
+      <origin xyz="0 0 ${post_height/2}"/>
+    </collision>
+    <xacro:cylinder_inertial m="${post_mass}" r="${post_radius}" h="${post_height}"/>
+  </link>
+
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/>
+    <child  link="post_link"/>
+    <origin xyz="0 0 ${base_height}" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="${-pi}" upper="${pi}" effort="${joint_effort}" velocity="${joint_velocity}"/>
+    <dynamics damping="0.1" friction="0.05"/>
+  </joint>
+
+  <!-- ====== JOINT 2: M2 — shoulder pitch ====== -->
+  <link name="upper_link">
+    <visual>
+      <geometry><box size="${upper_length} ${upper_thickness} ${upper_thickness}"/></geometry>
+      <origin xyz="${upper_length/2} 0 0"/>
+      <material name="grey"/>
+    </visual>
+    <collision>
+      <geometry><box size="${upper_length} ${upper_thickness} ${upper_thickness}"/></geometry>
+      <origin xyz="${upper_length/2} 0 0"/>
+    </collision>
+    <xacro:box_inertial m="${upper_mass}"
+      x="${upper_length}" y="${upper_thickness}" z="${upper_thickness}"/>
+  </link>
+
+  <joint name="joint_2" type="revolute">
+    <parent link="post_link"/>
+    <child  link="upper_link"/>
+    <origin xyz="0 0 ${post_height}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="${-pi/2}" upper="${pi/2}" effort="${joint_effort}" velocity="${joint_velocity}"/>
+    <dynamics damping="0.2" friction="0.1"/>
+  </joint>
+
+  <!-- ====== JOINT 3: M3 — elbow pitch ====== -->
+  <link name="forearm_link">
+    <visual>
+      <geometry><box size="${forearm_length} ${forearm_thickness} ${forearm_thickness}"/></geometry>
+      <origin xyz="${forearm_length/2} 0 0"/>
+      <material name="orange"/>
+    </visual>
+    <collision>
+      <geometry><box size="${forearm_length} ${forearm_thickness} ${forearm_thickness}"/></geometry>
+      <origin xyz="${forearm_length/2} 0 0"/>
+    </collision>
+    <xacro:box_inertial m="${forearm_mass}"
+      x="${forearm_length}" y="${forearm_thickness}" z="${forearm_thickness}"/>
+  </link>
+
+  <joint name="joint_3" type="revolute">
+    <parent link="upper_link"/>
+    <child  link="forearm_link"/>
+    <origin xyz="${upper_length} 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="${-pi}" upper="${pi}" effort="${joint_effort}" velocity="${joint_velocity}"/>
+    <dynamics damping="0.15" friction="0.08"/>
+  </joint>
+
+  <!-- ====== END EFFECTOR ====== -->
+  <link name="ee_link">
+    <visual>
+      <geometry><box size="${ee_size} ${ee_size} ${ee_size}"/></geometry>
+      <origin xyz="${ee_size/2} 0 0"/>
+      <material name="dark_grey"/>
+    </visual>
+    <xacro:box_inertial m="${ee_mass}" x="${ee_size}" y="${ee_size}" z="${ee_size}"/>
+  </link>
+
+  <joint name="ee_joint" type="fixed">
+    <parent link="forearm_link"/>
+    <child  link="ee_link"/>
+    <origin xyz="${forearm_length} 0 0" rpy="0 0 0"/>
+  </joint>
+
+</robot>

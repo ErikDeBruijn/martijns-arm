@@ -1,0 +1,53 @@
+# macOS
+.DS_Store
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# PlatformIO build
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Arduino IDE build cache
+build/
+*.elf
+*.bin
+*.hex
+*.map
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ROS2 build artefacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+**/colcon-defaults.yaml
+
+# Logs
+*.log
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+credentials/
+
+# Local notes
+NOTES.md
+notes/
+
+# Backup files
+*.bak
+*.orig
