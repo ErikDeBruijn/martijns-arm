@@ -1,11 +1,23 @@
 #pragma once
 #include <Arduino.h>
 
+// 1-op-1 utilities uit v19: fellEdge + LongPress
 namespace buttons {
 
-enum class Event { NONE, REC_SHORT, PLAY_SHORT, PLAY_LONG, DEL_LONG };
-
 void init();
-Event poll();   // call vanuit main loop; returnt eerstvolgende detected event of NONE
+
+// Debounced falling-edge detect (30ms). Voor short-press.
+bool fellEdge(int pin);
+
+// Long-press detector struct (1-op-1 met v19 LongPress).
+struct LongPress {
+    uint32_t t0 = 0;
+    bool     armed = false;
+    bool     fired = false;
+
+    bool update(int pin, uint32_t holdMs);
+    float progress(uint32_t holdMs);
+    bool  isHolding() { return armed && !fired; }
+};
 
 } // namespace buttons

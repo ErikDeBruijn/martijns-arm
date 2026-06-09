@@ -257,8 +257,10 @@ void setup() {
     homeIsSet_ = hp.present;
     nvs_storage::loadLimits(limits_);
 
-    // v19-parity: FLASH3 boot indicator
-    led::set(led::FLASH3, CRGB(80, 140, 255));
+    // 1-op-1 v19 opstartanimatie: kort wit flits, daarna update naar mode-LED
+    led::set(led::SOLID, CRGB(80, 80, 80)); led::update(); delay(300);
+    led::set(led::OFF,   CRGB::Black);      led::update(); delay(100);
+    updateLedForMode();
 
     // Set PID config defaults (output clamps op TMC VACTUAL bereik)
     for (int i = 0; i < cfg::NUM_JOINTS; i++) {
@@ -271,38 +273,69 @@ void setup() {
     enterMode(AppMode::IDLE);
 }
 
-static void handleButtonEvent(buttons::Event ev) {
-    switch (ev) {
-        case buttons::Event::REC_SHORT:
-            // Record toggle: in IDLE → start; in RECORDING → stop
-            if (mode_ == AppMode::IDLE)           enterMode(AppMode::RECORDING);
-            else if (mode_ == AppMode::RECORDING) enterMode(AppMode::IDLE);
-            break;
-        case buttons::Event::PLAY_SHORT:
-            // Homing + playback
-            if (mode_ == AppMode::IDLE)           enterMode(AppMode::PLAYBACK);
-            else if (mode_ == AppMode::PLAYBACK)  enterMode(AppMode::IDLE);
-            break;
-        case buttons::Event::PLAY_LONG:
-            // Sla home op (alle 3 assen)
-            if (homing::snapshotCurrentAsHome()) { Serial.println("Home OPGESLAGEN (BTN_PLAY lang)"); homeIsSet_ = true; }
-            else                                  Serial.println("!! Home opslaan mislukt");
-            updateLedForMode();
-            break;
-        case buttons::Event::DEL_LONG:
-            // Motion file verwijderen
-            if (motion_file::remove()) Serial.println("Motion file verwijderd (BTN_DEL lang)");
-            updateLedForMode();
-            break;
-        case buttons::Event::NONE:
-            break;
-    }
-}
+// 1-op-1 met v19: LongPress instances en delFlashUntil mechanism leven in loop()
+static buttons::LongPress lpPlay_;
+static buttons::LongPress lpDel_;
 
 void loop() {
+    static uint32_t delFlashUntil = 0;
+
     pollSerialCommands();
     tmc::pollEdgeDetect(tmcEdgeReporter);
-    handleButtonEvent(buttons::poll());
+
+    // ── BTN_DEL lang (1-op-1 v19) ───────────────────────────
+    if (lpDel_.update(cfg::BTN_DEL_PIN, cfg::DEL_HOLD_MS)) {
+        if (mode_ == AppMode::RECORDING) { recording::stop(); mode_ = AppMode::IDLE; }
+        if (mode_ == AppMode::PLAYBACK)  { playback::stop();  mode_ = AppMode::IDLE; }
+        if (mode_ == AppMode::HOMING)    { tmc::disableAll(); mode_ = AppMode::IDLE; }
+        motion_file::remove();
+        led::set(led::BLINK_1HZ, CRGB(255, 0, 0));
+        delFlashUntil = millis() + 1500;
+    }
+    if (delFlashUntil > 0 && millis() >= delFlashUntil) {
+        delFlashUntil = 0; updateLedForMode();
+    }
+
+    // ── BTN_PLAY lang: home opslaan (1-op-1 v19) ────────────
+    if (mode_ == AppMode::IDLE) {
+        if (lpPlay_.isHolding())
+            led::set(led::PROGRESS, CRGB(255, 220, 0), lpPlay_.progress(cfg::BTN_HOLD_MS));
+
+        if (lpPlay_.update(cfg::BTN_PLAY_PIN, cfg::BTN_HOLD_MS)) {
+            if (homing::snapshotCurrentAsHome()) {
+                homeIsSet_ = true;
+                led::set(led::FLASH3, CRGB(80, 140, 255));
+            } else {
+                Serial.println("ERROR: sensor niet leesbaar bij home opslaan.");
+                led::set(led::BLINK_5HZ, CRGB(255, 0, 0));
+            }
+        } else if (!lpPlay_.isHolding()) {
+            if (delFlashUntil == 0) updateLedForMode();
+        }
+    } else {
+        lpPlay_.update(cfg::BTN_PLAY_PIN, cfg::BTN_HOLD_MS);
+    }
+
+    // ── BTN_PLAY kort: homing + playback (1-op-1 v19) ───────
+    if (buttons::fellEdge(cfg::BTN_PLAY_PIN)) {
+        if (mode_ == AppMode::IDLE) {
+            if (!homeIsSet_) {
+                Serial.println("!! Geen home. Houd BTN_PLAY lang in.");
+                led::set(led::BLINK_5HZ, CRGB(255, 80, 0)); delay(1000); updateLedForMode();
+            } else if (!motion_file::exists()) {
+                Serial.println("!! Geen motion file. Neem eerst op.");
+                led::set(led::BLINK_5HZ, CRGB(255, 80, 0)); delay(1000); updateLedForMode();
+            } else {
+                enterMode(AppMode::PLAYBACK);
+            }
+        }
+    }
+
+    // ── BTN_REC kort (1-op-1 v19) ───────────────────────────
+    if (buttons::fellEdge(cfg::BTN_REC_PIN)) {
+        if      (mode_ == AppMode::RECORDING) enterMode(AppMode::IDLE);
+        else if (mode_ == AppMode::IDLE)      enterMode(AppMode::RECORDING);
+    }
 
     // v19-parity: encoder-poll ook in IDLE, zodat armUnwrappedDeg bijblijft
     // bij handmatige beweging (nodig voor LIMITSET tussen extremes, status reads).
