@@ -36,7 +36,9 @@
 //    Wijzigingen t.o.v. v14.6:
 //      • TCA_CHANNELS  gewijzigd: motor-encoders nu mux {0, 3, 7}
 //      • TCA_ARM_CHANNELS gewijzigd: arm-encoders nu mux {1, 2, 6}
-//      • M1 = 200-staps (1.8°), M2/M3 = 400-staps (0.9°) — bevestigd via meting
+//      • M1/M2/M3 = ALLEMAAL 200-staps (1.8°/step) — bevestigd via encoder-meting
+//        op driver-test firmware 2026-06-09 met arm-AS5600. Vorige comment ("M2/M3 = 400-staps")
+//        was FOUT. MOTOR_VACTUAL_CORR aanpassen indien nog op 0.5f voor M2/M3 staat.
 //        MOTOR_VACTUAL_CORR[0]=0.5 compenseert verschil in microstaps/omwenteling:
 //        v18.0 aanname: M1=51200, M2/M3=102400 µsteps/rev  ← onjuist
 //        v18.1: M2+M3 zijn ook Kysan 1124090 (200-step) → MOTOR_VACTUAL_CORR[1/2] = 0.5f
@@ -426,7 +428,14 @@ static inline float clampF(float v, float lo, float hi) {
 // M1 richting omgekeerd (negatief) — v16 homing toonde aanhoudende fout op M1:
 //   error bleef −10..−16° bij spd=−16000 → motor draaide verkeerde kant op.
 // M2, M3 = 400-staps → geen correctie nodig
-static const float MOTOR_VACTUAL_CORR[3] = { -0.5f, 0.5f, 0.5f };  // v18.1: M2+M3 ook 200-step (Kysan 1124090) → factor-2 VACTUAL correctie
+// 2026-06-09 meting via driver-test firmware + AS5600 encoder bevestigt:
+//   M1 = 200-step (direction omgekeerd)
+//   M2 = 200-step (normaal direction)        — v18.1 comment was correct
+//   M3 = 400-step (normaal direction)        — v18.1 comment was FOUT, dit is 400-step
+// STEPS_PER_REV = 102400 (= 256 µstep × 400 full-step) gaat uit van 400-step.
+// CORR magnitude = 0.5 → halve VACTUAL = compensation voor 200-step motor.
+// CORR magnitude = 1.0 → volle VACTUAL = correct voor 400-step motor.
+static const float MOTOR_VACTUAL_CORR[3] = { -0.5f, 0.5f, 1.0f };
 
 // v14: motorsturing via VACTUAL — vervangt steppers[i].setSpeed()
 // steps_per_s wordt omgezet naar VACTUAL register waarde
@@ -1145,12 +1154,20 @@ void handlePlayback() {
         long  refSteps = lround(refF);
 
         // v19: soft endstop clamp — als arm voorbij limit, hou positie vast
+        // BUG FIX (2026-06-09): naam-agnostisch via fmin/fmax. Origineel v19 brak
+        // wanneer min > max in NVS (gebeurt door ARM_ENC_DIR=-1: "links" is sensor-grote,
+        // "rechts" sensor-kleinere). Dan triggerde clamp altijd → arm bewoog niet.
         {
             float curArmDeg = mc[i].armUnwrappedDeg;
-            if (!isnan(lim_max_deg[i]) && curArmDeg >= lim_max_deg[i]) {
+            bool hasMin = !isnan(lim_min_deg[i]);
+            bool hasMax = !isnan(lim_max_deg[i]);
+            if (hasMin && hasMax) {
+                float lo = fminf(lim_min_deg[i], lim_max_deg[i]);
+                float hi = fmaxf(lim_min_deg[i], lim_max_deg[i]);
+                if (curArmDeg >= hi || curArmDeg <= lo) refSteps = encFiltered;
+            } else if (hasMax && curArmDeg >= lim_max_deg[i]) {
                 refSteps = encFiltered;
-            }
-            if (!isnan(lim_min_deg[i]) && curArmDeg <= lim_min_deg[i]) {
+            } else if (hasMin && curArmDeg <= lim_min_deg[i]) {
                 refSteps = encFiltered;
             }
         }
@@ -1446,7 +1463,12 @@ static void cmdCurrent(int idx, int pct) {
     if (idx < 0 || idx > 2) { cmdReply("<ERR ", "idx must be 0..2"); return; }
     if (pct < 0 || pct > 100) { cmdReply("<ERR ", "pct must be 0..100"); return; }
     drivers[idx].setRunCurrent((uint8_t)pct);
-    cmdReplyf("<OK ", "current M%d run=%d%%", idx + 1, pct);
+    // BUG FIX (2026-06-09): library's setRunCurrent veroorzaakt state-drift —
+    // stealth-mode of microsteps kan resetten. Bevestigd in driver-test firmware
+    // experimenten. Defensive re-write om consistente config te houden.
+    drivers[idx].setMicrostepsPerStep(256);
+    drivers[idx].disableStealthChop();
+    cmdReplyf("<OK ", "current M%d run=%d%% (config re-asserted)", idx + 1, pct);
 }
 
 static void cmdLimitSet(int idx, const String& which) {
@@ -1786,7 +1808,7 @@ void setup() {
         drivers[i].setMicrostepsPerStep(256);
         drivers[i].enableAutomaticCurrentScaling();
         drivers[i].enableAutomaticGradientAdaptation();
-        drivers[i].enableStealthChop();
+        drivers[i].disableStealthChop();  // task #3: spreadCycle alleen — debug van uitvallende motoren
         drivers[i].setStandstillMode(TMC2209::FREEWHEELING);
         drivers[i].disable();   // uit bij opstart — enable() bij homing
         delay(50);
@@ -1806,7 +1828,7 @@ void setup() {
     Serial.println("─────────────────────────────────────────────");
     Serial.println("  Robotarm v18  –  3-as Teach & Repeat  (3.5:1 tandriem)");
     Serial.println("  Aansturing: TMC2209 UART/VACTUAL (256 microsteps)");
-    Serial.println("  M1=200-staps(1.8°/stap)  M2/M3=400-staps(0.9°/stap)");
+    Serial.println("  M1=200-staps(1.8°/stap)  M2=200-staps(1.8°/stap)  M3=400-staps(0.9°/stap)");
     Serial.println("  PID-bron:   arm-as encoder (3.5x hogere resolutie)");
     Serial.println("  Vernier:    6x AS5600 (motor + arm assen)");
     Serial.println("─────────────────────────────────────────────");
