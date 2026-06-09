@@ -764,6 +764,12 @@ bool startHoming() {
 
     homingUseMultiTurn = encValidFromHome[0] && encValidFromHome[1] && encValidFromHome[2];
 
+    // BUG FIX (2026-06-09): defensive re-assert TMC config — library state-drift
+    for (int i = 0; i < 3; i++) {
+        drivers[i].setMicrostepsPerStep(256);
+        drivers[i].disableStealthChop();
+    }
+
     for (int i = 0; i < 3; i++) {
         drivers[i].enable();
                 setMotorSpeed(i, 0.0f);
@@ -887,6 +893,11 @@ void handleHoming() {
 
 // ─────────────────────────── RECORD ─────────────────────────
 bool startRecording() {
+    // BUG FIX (2026-06-09): defensive re-assert TMC config — library state-drift
+    for (int i = 0; i < 3; i++) {
+        drivers[i].setMicrostepsPerStep(256);
+        drivers[i].disableStealthChop();
+    }
     for (int i = 0; i < 3; i++) {
         if (!encValidFromHome[i]) {
             Serial.println("!! Eerst homen (BTN_PLAY kort) voor opname.");
@@ -1034,6 +1045,12 @@ bool startPlayback() {
     if (!SD_MMC.exists(MOTION_FILE)) { Serial.println("No motion file."); return false; }
     File f = SD_MMC.open(MOTION_FILE, FILE_READ);
     if (!f) { Serial.println("Failed to open motion file."); return false; }
+
+    // BUG FIX (2026-06-09): defensive re-assert TMC config — library state-drift
+    for (int i = 0; i < 3; i++) {
+        drivers[i].setMicrostepsPerStep(256);
+        drivers[i].disableStealthChop();
+    }
 
     for (int i = 0; i < 3; i++) {
                 setMotorSpeed(i, 0.0f);
@@ -1341,6 +1358,28 @@ void deleteMotionFile() {
 // de PID de arm op huidige positie i.p.v. door te duwen.
 // Arrays zijn boven gedeclareerd zodat handlePlayback ze kan zien.
 
+// 2026-06-09: per-joint run-current opslaan/laden in NVS — niet langer alleen boot default.
+static int currentRunPct[3] = { TMC_RUN_CURRENT, TMC_RUN_CURRENT, TMC_RUN_CURRENT };
+
+static void saveCurrentsToNVS() {
+    prefs.begin(NVS_NS, false);
+    char k[16];
+    for (int i = 0; i < 3; i++) {
+        snprintf(k, sizeof(k), "cur%d", i); prefs.putInt(k, currentRunPct[i]);
+    }
+    prefs.end();
+}
+
+static void loadCurrentsFromNVS() {
+    prefs.begin(NVS_NS, true);
+    char k[16];
+    for (int i = 0; i < 3; i++) {
+        snprintf(k, sizeof(k), "cur%d", i);
+        currentRunPct[i] = prefs.getInt(k, TMC_RUN_CURRENT);
+    }
+    prefs.end();
+}
+
 static void saveLimitsToNVS() {
     prefs.begin(NVS_NS, false);
     char k[16];
@@ -1391,7 +1430,8 @@ static void cmdHelp() {
     Serial.println("  >DEL                        verwijder motion file");
     Serial.println("  >LIMITSET <i> MIN|MAX       leg endstop vast op huidige pos");
     Serial.println("  >LIMITS                     toon endstops + huidige posities");
-    Serial.println("  >LIMITSAVE                  NVS write");
+    Serial.println("  >LIMITSAVE                  NVS write soft endstops");
+    Serial.println("  >CURRENTSAVE                NVS write per-joint run-current");
     Serial.println("  >LIMITCLR <i>               wis endstops voor joint i");
     Serial.println("  >ENCRAW                     raw AS5600 hoeken (motor+arm channels) — debug");
     Serial.println("  >TMCSTATUS                  TMC2209 DRV_STATUS per motor (temp/ot/cs/sg)");
@@ -1450,6 +1490,34 @@ static void cmdMode(const String& target) {
     }
 }
 
+// v19+ diagnose: open-loop spin van een driver met defensive config-re-assert.
+// Vereist mode=IDLE. Geen PID, geen encoder feedback — pure motor drive.
+static void cmdSpin(int idx, int32_t vactual, int durMs) {
+    if (mode != IDLE) { cmdReplyf("<ERR ", "SPIN only in IDLE (now %d)", (int)mode); return; }
+    if (idx < 0 || idx > 2) { cmdReply("<ERR ", "idx 0..2"); return; }
+    if (durMs < 0 || durMs > 30000) { cmdReply("<ERR ", "duration 0..30000ms"); return; }
+    drivers[idx].setMicrostepsPerStep(256);
+    drivers[idx].disableStealthChop();
+    drivers[idx].enable();
+    drivers[idx].moveAtVelocity(vactual);
+    cmdReplyf("<OK ", "SPIN M%d v=%ld dur=%dms", idx+1, (long)vactual, durMs);
+    delay(durMs);
+    drivers[idx].moveAtVelocity(0);
+    delay(100);
+    // Driver blijft ENABLED → hold-current actief voor metingen direct na SPIN.
+    cmdReplyf("<OK ", "SPIN M%d done", idx+1);
+}
+
+// v19+ diagnose: print arm-encoder raw graden + unwrapped (PID-frame) graden.
+static void cmdPos(int idx) {
+    if (idx < 0 || idx > 2) { cmdReply("<ERR ", "idx 0..2"); return; }
+    uint16_t raw = 0;
+    if (!readRawArmAngle(idx, raw)) { cmdReply("<ERR ", "encoder read fail"); return; }
+    float rawDeg = rawToDeg(raw);
+    float unwrappedDeg = mc[idx].armUnwrappedDeg;
+    cmdReplyf("<OK ", "POS M%d raw=%.2f° unwrapped=%.2f°", idx+1, rawDeg, unwrappedDeg);
+}
+
 static void cmdTune(const String& gainKey, int idx, float val) {
     if (idx < 0 || idx > 2) { cmdReply("<ERR ", "idx must be 0..2"); return; }
     if      (gainKey == "KP") KP_SPEED[idx] = val;
@@ -1463,12 +1531,18 @@ static void cmdCurrent(int idx, int pct) {
     if (idx < 0 || idx > 2) { cmdReply("<ERR ", "idx must be 0..2"); return; }
     if (pct < 0 || pct > 100) { cmdReply("<ERR ", "pct must be 0..100"); return; }
     drivers[idx].setRunCurrent((uint8_t)pct);
+    currentRunPct[idx] = pct;
     // BUG FIX (2026-06-09): library's setRunCurrent veroorzaakt state-drift —
-    // stealth-mode of microsteps kan resetten. Bevestigd in driver-test firmware
-    // experimenten. Defensive re-write om consistente config te houden.
+    // stealth-mode of microsteps kan resetten. Defensive re-write.
     drivers[idx].setMicrostepsPerStep(256);
     drivers[idx].disableStealthChop();
-    cmdReplyf("<OK ", "current M%d run=%d%% (config re-asserted)", idx + 1, pct);
+    cmdReplyf("<OK ", "current M%d run=%d%% (RAM only — CURRENTSAVE voor NVS)", idx + 1, pct);
+}
+
+static void cmdCurrentSave() {
+    saveCurrentsToNVS();
+    cmdReplyf("<OK ", "currents saved to NVS: [%d, %d, %d]",
+              currentRunPct[0], currentRunPct[1], currentRunPct[2]);
 }
 
 static void cmdLimitSet(int idx, const String& which) {
@@ -1671,8 +1745,24 @@ static void processCmdLine(const String& line) {
     }
     else if (verb == "LIMITS")    cmdLimits();
     else if (verb == "LIMITSAVE") cmdLimitSave();
+    else if (verb == "CURRENTSAVE") cmdCurrentSave();
     else if (verb == "ENCRAW")    cmdEncRaw();
     else if (verb == "TMCSTATUS") cmdTmcStatus();
+    else if (verb == "POS") {
+        rest.trim();
+        if (rest.length() == 0) { cmdReply("<ERR ", "usage: POS <i>"); return; }
+        cmdPos(rest.toInt());
+    }
+    else if (verb == "SPIN") {
+        rest.trim();
+        int s1 = rest.indexOf(' ');
+        int s2 = (s1 < 0) ? -1 : rest.indexOf(' ', s1 + 1);
+        if (s1 < 0 || s2 < 0) { cmdReply("<ERR ", "usage: SPIN <i> <vactual> <duration_ms>"); return; }
+        int idx = rest.substring(0, s1).toInt();
+        long vac = rest.substring(s1 + 1, s2).toInt();
+        int dur = rest.substring(s2 + 1).toInt();
+        cmdSpin(idx, (int32_t)vac, dur);
+    }
     else if (verb == "LIMITCLR") {
         rest.trim();
         if (rest.length() == 0) { cmdReply("<ERR ", "usage: LIMITCLR <i>"); return; }
@@ -1774,6 +1864,7 @@ void setup() {
     // NVS home laden
     loadHomeFromNVS();
     loadLimitsFromNVS();   // v19: soft endstops
+    loadCurrentsFromNVS(); // v19+ 2026-06-09: per-joint run-current
 
     // v11: Vernier absolute positiebepaling
     // Werkt altijd correct ongeacht waar de arm staat na een reset,
@@ -1803,7 +1894,7 @@ void setup() {
     for (int i = 0; i < 3; i++) {
         drivers[i].setup(TMCSerial, 115200, TMC_ADDR[i], UART_RX_PIN, UART_TX_PIN);
         drivers[i].setHardwareEnablePin(UART_EN_PIN);
-        drivers[i].setRunCurrent(TMC_RUN_CURRENT);
+        drivers[i].setRunCurrent((uint8_t)currentRunPct[i]);
         drivers[i].setHoldCurrent(TMC_HOLD_CURRENT);
         drivers[i].setMicrostepsPerStep(256);
         drivers[i].enableAutomaticCurrentScaling();
