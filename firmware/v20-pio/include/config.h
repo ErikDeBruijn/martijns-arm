@@ -54,10 +54,19 @@ constexpr int BTN_DEL_PIN   = 1;
 constexpr uint32_t BTN_HOLD_MS  = 1500;  // lang-druk drempel
 constexpr uint32_t DEL_HOLD_MS  = 2000;
 
-// LED (FastLED)
-constexpr int  LED_PIN       = 18;
-constexpr int  LED_COUNT     = 1;
-constexpr int  LED_TYPE      = 0;  // resolveert in led.cpp via FastLED template
+// LED (FastLED) — matched to v19
+constexpr int  LED_PIN        = 46;
+constexpr int  LED_COUNT      = 1;
+constexpr int  LED_BRIGHTNESS = 80;
+
+// SD_MMC pin-config voor SparkFun ESP32-S3 Thing Plus (niet ESP32-S3 defaults)
+constexpr int SD_CLK = 38;
+constexpr int SD_CMD = 34;
+constexpr int SD_D0  = 39;
+constexpr int SD_D1  = 40;
+constexpr int SD_D2  = 47;
+constexpr int SD_D3  = 33;
+constexpr int SD_DET = 48;  // card-detect (INPUT_PULLDOWN)
 
 // Files
 constexpr const char* MOTION_FILE = "/motion.csv";

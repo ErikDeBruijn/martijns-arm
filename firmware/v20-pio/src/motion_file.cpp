@@ -33,7 +33,23 @@ bool parseCsvLine(const char* line, Sample& out) {
 }
 
 bool init() {
-    return SD_MMC.begin("/sdcard", true);
+    pinMode(cfg::SD_DET, INPUT_PULLDOWN);
+    if (!digitalRead(cfg::SD_DET)) {
+        Serial.println("SD: no card detected (SD_DET low)");
+        return false;
+    }
+    if (!SD_MMC.setPins(cfg::SD_CLK, cfg::SD_CMD,
+                        cfg::SD_D0, cfg::SD_D1, cfg::SD_D2, cfg::SD_D3)) {
+        Serial.println("SD: setPins failed");
+        return false;
+    }
+    // 4-bit mode (false), zoals v19
+    if (!SD_MMC.begin("/sdcard", false)) {
+        Serial.println("SD: begin failed");
+        return false;
+    }
+    Serial.printf("SD OK, %llu MB\n", SD_MMC.cardSize() / (1024ULL * 1024ULL));
+    return true;
 }
 
 bool exists()  { return SD_MMC.exists(cfg::MOTION_FILE); }

@@ -4,20 +4,21 @@
 
 namespace led {
 
-enum Anim { OFF, SOLID, BLINK_1HZ, BLINK_5HZ, PULSE };
+// 1-op-1 met v19 LedAnim enum (volgorde + namen)
+enum Anim { OFF, SOLID, PULSE_SLOW, PULSE_FAST, BLINK_1HZ, BLINK_5HZ, PROGRESS, FLASH3 };
 
 struct State {
-    Anim    anim     = OFF;
-    CRGB    color    = CRGB::Black;
-    uint8_t progress = 0;  // 0..255 voor pulse
+    Anim     anim       = OFF;
+    CRGB     color      = CRGB::Black;
+    float    progress   = 0.0f;
+    uint32_t lastMs     = 0;
+    uint8_t  flashCount = 0;
+    bool     flashOn    = false;
+    bool     flashDone  = false;
 };
 
 void init();
-void set(Anim anim, CRGB color);
-void update();                       // call in main loop, niet-blocking
-
-// Pure functie: bepaal of LED op moment `nowMs` aan moet zijn voor gegeven anim.
-// Wordt gebruikt door update() én is unit-testbaar.
-bool isOnAt(Anim anim, uint32_t nowMs);
+void set(Anim anim, CRGB color, float progress = 0.0f);
+void update();
 
 } // namespace led

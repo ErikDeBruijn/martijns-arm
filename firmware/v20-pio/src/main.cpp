@@ -11,10 +11,13 @@
 #include "recording.h"
 #include "playback.h"
 #include "homing.h"
+#include "buttons.h"
 
 // ─── Globale state ─────────────────────────────────────────
 enum class AppMode { IDLE, RECORDING, HOMING, PLAYBACK };
-static AppMode mode_ = AppMode::IDLE;
+static AppMode mode_      = AppMode::IDLE;
+static bool    errorFlag_ = false;
+static bool    homeIsSet_ = false;
 
 static pid::Gains pidGains_[cfg::NUM_JOINTS] = {
     {6.5f, 0.0f, 3.0f},
@@ -29,6 +32,20 @@ static int currentPct_[cfg::NUM_JOINTS] = {
 };
 
 // ─── Helpers ───────────────────────────────────────────────
+// 1-op-1 met v19 updateLedForMode()
+static void updateLedForMode() {
+    if (errorFlag_) { led::set(led::BLINK_5HZ, CRGB(255, 0, 0)); return; }
+    switch (mode_) {
+        case AppMode::IDLE:
+            if (!homeIsSet_) led::set(led::PULSE_SLOW, CRGB(255, 80, 0));
+            else             led::set(led::PULSE_SLOW, CRGB( 80,140,255));
+            break;
+        case AppMode::RECORDING: led::set(led::BLINK_1HZ,  CRGB(220, 0,  0));   break;
+        case AppMode::HOMING:    led::set(led::PULSE_FAST, CRGB(  0,200,255));  break;
+        case AppMode::PLAYBACK:  led::set(led::SOLID,      CRGB(  0,180,  0));  break;
+    }
+}
+
 static void tmcEdgeReporter(const tmc::EdgeEvent& e) {
     Serial.printf("!! M%d TMC %s t=%lu cs=%u\n", e.joint, e.label, e.millis, e.currentScaling);
 }
@@ -116,8 +133,7 @@ static void enterMode(AppMode m) {
     if (mode_ == AppMode::PLAYBACK)  playback::stop();
     mode_ = m;
     if (m == AppMode::RECORDING) {
-        if (!recording::start()) { Serial.println("<ERR startRecording failed"); mode_ = AppMode::IDLE; return; }
-        led::set(led::BLINK_1HZ, CRGB::Red);
+        if (!recording::start()) { Serial.println("<ERR startRecording failed"); mode_ = AppMode::IDLE; updateLedForMode(); return; }
     } else if (m == AppMode::PLAYBACK) {
         playback::Config c{};
         for (int i = 0; i < cfg::NUM_JOINTS; i++) {
@@ -126,15 +142,13 @@ static void enterMode(AppMode m) {
             c.limits[i] = limits_[i];
         }
         homing::initFromVernier();
-        if (!playback::start(c)) { Serial.println("<ERR startPlayback failed"); mode_ = AppMode::IDLE; return; }
-        led::set(led::BLINK_1HZ, CRGB::Green);
+        if (!playback::start(c)) { Serial.println("<ERR startPlayback failed"); mode_ = AppMode::IDLE; updateLedForMode(); return; }
     } else if (m == AppMode::IDLE) {
         tmc::disableAll();
-        led::set(led::SOLID, CRGB::Blue);
     } else if (m == AppMode::HOMING) {
         homing::initFromVernier();
-        led::set(led::BLINK_5HZ, CRGB::Yellow);
     }
+    updateLedForMode();
     Serial.printf("<OK mode=%s\n",
         m == AppMode::IDLE ? "IDLE" :
         m == AppMode::RECORDING ? "RECORDING" :
@@ -178,8 +192,8 @@ static void handleCommand(const commands::ParsedCommand& pc) {
             Serial.printf("<OK current M%d run=%d%%\n", pc.jointIdx+1, pc.percent);
             break;
         case V::HOME:
-            if (homing::snapshotCurrentAsHome()) Serial.println("<OK home saved");
-            else                                  Serial.println("<ERR home failed");
+            if (homing::snapshotCurrentAsHome()) { Serial.println("<OK home saved"); homeIsSet_ = true; updateLedForMode(); }
+            else                                   Serial.println("<ERR home failed");
             break;
         case V::DEL:
             if (motion_file::remove()) Serial.println("<OK motion file deleted");
@@ -231,6 +245,7 @@ void setup() {
     Serial.println("Type >HELP voor commando-overzicht");
 
     led::init();
+    buttons::init();
     encoders::init();
     tmc::init();
     for (int i = 0; i < cfg::NUM_JOINTS; i++) tmc::setCurrentPct(i, currentPct_[i]);
@@ -239,7 +254,11 @@ void setup() {
     // Herstel home + endstops uit NVS
     nvs_storage::HomePose hp;
     nvs_storage::loadHome(hp);
+    homeIsSet_ = hp.present;
     nvs_storage::loadLimits(limits_);
+
+    // v19-parity: FLASH3 boot indicator
+    led::set(led::FLASH3, CRGB(80, 140, 255));
 
     // Set PID config defaults (output clamps op TMC VACTUAL bereik)
     for (int i = 0; i < cfg::NUM_JOINTS; i++) {
@@ -252,9 +271,50 @@ void setup() {
     enterMode(AppMode::IDLE);
 }
 
+static void handleButtonEvent(buttons::Event ev) {
+    switch (ev) {
+        case buttons::Event::REC_SHORT:
+            // Record toggle: in IDLE → start; in RECORDING → stop
+            if (mode_ == AppMode::IDLE)           enterMode(AppMode::RECORDING);
+            else if (mode_ == AppMode::RECORDING) enterMode(AppMode::IDLE);
+            break;
+        case buttons::Event::PLAY_SHORT:
+            // Homing + playback
+            if (mode_ == AppMode::IDLE)           enterMode(AppMode::PLAYBACK);
+            else if (mode_ == AppMode::PLAYBACK)  enterMode(AppMode::IDLE);
+            break;
+        case buttons::Event::PLAY_LONG:
+            // Sla home op (alle 3 assen)
+            if (homing::snapshotCurrentAsHome()) { Serial.println("Home OPGESLAGEN (BTN_PLAY lang)"); homeIsSet_ = true; }
+            else                                  Serial.println("!! Home opslaan mislukt");
+            updateLedForMode();
+            break;
+        case buttons::Event::DEL_LONG:
+            // Motion file verwijderen
+            if (motion_file::remove()) Serial.println("Motion file verwijderd (BTN_DEL lang)");
+            updateLedForMode();
+            break;
+        case buttons::Event::NONE:
+            break;
+    }
+}
+
 void loop() {
     pollSerialCommands();
     tmc::pollEdgeDetect(tmcEdgeReporter);
+    handleButtonEvent(buttons::poll());
+
+    // v19-parity: encoder-poll ook in IDLE, zodat armUnwrappedDeg bijblijft
+    // bij handmatige beweging (nodig voor LIMITSET tussen extremes, status reads).
+    static uint32_t lastEncMs = 0;
+    uint32_t now = millis();
+    if (now - lastEncMs >= cfg::SAMPLE_MS) {
+        lastEncMs = now;
+        for (int i = 0; i < cfg::NUM_JOINTS; i++) {
+            float deg = 0.0f;
+            encoders::readArmAxis(i, deg);
+        }
+    }
 
     switch (mode_) {
         case AppMode::RECORDING: recording::update(); break;

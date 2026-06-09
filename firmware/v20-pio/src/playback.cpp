@@ -56,11 +56,12 @@ namespace {
         samples_.fill = 3;
     }
 
+    // 1-op-1 met v19: stepsOut = ARM_ENC_DIR * armDegToSteps(armUnwrappedDeg)
     long armDegToSteps(float deg) {
-        return (long)((deg / 360.0f) * (float)cfg::STEPS_PER_ARM_REV);
+        return (long)((float)cfg::ARM_ENC_DIR * (deg / 360.0f) * (float)cfg::STEPS_PER_ARM_REV);
     }
     float armStepsToDeg(long steps) {
-        return ((float)steps / (float)cfg::STEPS_PER_ARM_REV) * 360.0f;
+        return (float)cfg::ARM_ENC_DIR * ((float)steps / (float)cfg::STEPS_PER_ARM_REV) * 360.0f;
     }
 }
 
